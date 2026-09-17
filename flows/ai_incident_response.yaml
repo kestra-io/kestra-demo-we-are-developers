@@ -1,0 +1,194 @@
+id: ai_incident_response
+namespace: demo.wearedevelopers
+
+description: |
+  Agentic AI incident response - governed end to end.
+
+  An alert fires. An AI agent gathers context across all four orchestration
+  domains at once (infrastructure, data, application, business process),
+  proposes a root cause and a remediation, and then stops. Nothing touches
+  production until a human approves. Kestra executes the approved action
+  deterministically and records who approved what, and when.
+
+  This is the "agentic AI as a governed layer" story: the agent decides, the
+  orchestrator enforces. The flow is also registered as an MCP tool, so an AI
+  assistant can invoke it directly - and still hits the same approval gate.
+
+  The agent reasoning and the remediation calls use dummy data, so the flow runs
+  anywhere with no model credentials and no extra plugins. Each simulated task
+  names the real task type it stands in for.
+
+labels:
+  owner: platform-team
+  demo: we-are-developers
+  domain: agentic-ai
+
+inputs:
+  - id: service
+    type: SELECT
+    displayName: Affected service
+    defaults: checkout-api
+    values:
+      - label: checkout-api
+        value: checkout-api
+      - label: payments-worker
+        value: payments-worker
+      - label: orders-etl
+        value: orders-etl
+
+  - id: alert_summary
+    type: STRING
+    displayName: Alert payload
+    defaults: p99 latency 4200ms, error rate 12%, sustained 6 minutes
+
+variables:
+  # Service tier drives severity - the agent reads it the same way a human would.
+  service_tier:
+    checkout-api: SEV1
+    payments-worker: SEV1
+    orders-etl: SEV3
+
+tasks:
+  # ------------------------------------------------- 1. GATHER CONTEXT --
+  # One agent, four domains, in parallel. This is the unified-orchestration
+  # point: the same control plane reaches metrics, pipelines, deploys and
+  # tickets, so the agent gets the whole picture instead of one team's slice.
+  # Real pipeline: each of these is the actual source task - elasticsearch or
+  # prometheus for metrics, a JDBC query for pipeline state, the GitHub or Argo
+  # plugin for deploys, servicenow.Get for the ticket queue.
+  - id: gather_context
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: infrastructure_signals
+        type: io.kestra.plugin.core.log.Log
+        message: "[infrastructure] {{ inputs.service }}: 6/8 pods healthy, CPU 94% on 2 nodes, OOMKilled x3 in 10min"
+
+      - id: data_signals
+        type: io.kestra.plugin.core.log.Log
+        message: "[data] upstream pipeline orders_elt succeeded 14min ago, no schema drift detected"
+
+      - id: application_signals
+        type: io.kestra.plugin.core.log.Log
+        message: "[application] deploy v2.14.0 released 11min ago by release-bot, previous stable v2.13.4"
+
+      - id: business_signals
+        type: io.kestra.plugin.core.log.Log
+        message: "[business] 47 support tickets opened in 10min, 3 enterprise accounts affected"
+
+  # ----------------------------------------------------- 2. AGENT TRIAGE --
+  # Real pipeline: io.kestra.plugin.ai.agent.AIAgent given the four signals
+  # above as context, or io.kestra.plugin.ai.completion.JSONStructuredExtraction
+  # to force the response into exactly these fields. Bring any model, including
+  # a self-hosted one - the governance below does not change either way.
+  - id: agent_triage
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      severity: "{{ vars.service_tier[inputs.service] }}"
+      root_cause: "Deploy v2.14.0 introduced a memory leak; pods OOMKilled under normal load"
+      proposed_action: "Roll back {{ inputs.service }} to v2.13.4 and scale to 10 replicas"
+      confidence: "0.87"
+      blast_radius: "3 enterprise accounts, 47 tickets, checkout conversion down 31%"
+
+  # Stamp the incident onto the execution so it is filterable and auditable
+  # later - this is the audit trail, not a log line someone has to go find.
+  - id: tag_incident
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      severity: "{{ outputs.agent_triage.values.severity }}"
+      service: "{{ inputs.service }}"
+      agent_confidence: "{{ outputs.agent_triage.values.confidence }}"
+
+  - id: present_findings
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      === AGENT ASSESSMENT ===
+      Severity      : {{ outputs.agent_triage.values.severity }}
+      Root cause    : {{ outputs.agent_triage.values.root_cause }}
+      Blast radius  : {{ outputs.agent_triage.values.blast_radius }}
+      Confidence    : {{ outputs.agent_triage.values.confidence }}
+
+      PROPOSED ACTION (requires human approval)
+      -> {{ outputs.agent_triage.values.proposed_action }}
+
+  # ---------------------------------------------------- 3. APPROVAL GATE --
+  # The execution stops here. The agent has decided what it wants to do and it
+  # cannot do it. A human approves or rejects in the UI, and Kestra records who
+  # and when. This is the whole point of the demo.
+  - id: approval_gate
+    type: io.kestra.plugin.core.flow.Pause
+    pauseDuration: PT1H
+    onResume:
+      - id: approved
+        displayName: Approve the agent's remediation?
+        type: BOOL
+        defaults: true
+      - id: approver_note
+        displayName: Note for the incident record
+        type: STRING
+        defaults: Confirmed against the deploy timeline - approving rollback.
+
+  # --------------------------------------------- 4. GOVERNED EXECUTION --
+  - id: decision
+    type: io.kestra.plugin.core.flow.If
+    # Guarded on purpose. If the gate expires with nobody home, onResume is
+    # never populated - not even with the defaults declared above - so an
+    # unguarded expression would fail the execution. Fail safe instead: no
+    # approval means no production change.
+    condition: "{{ outputs.approval_gate.onResume is defined and outputs.approval_gate.onResume.approved }}"
+    then:
+      # Real pipeline: the helm, kubernetes or argocd rollback task, then the
+      # scaling task. Deterministic, versioned, permissioned - the agent
+      # proposed these, it did not get to run them itself.
+      - id: rollback_deploy
+        type: io.kestra.plugin.core.log.Log
+        message: "helm rollback {{ inputs.service }} --version v2.13.4  -> released"
+
+      - id: scale_replicas
+        type: io.kestra.plugin.core.log.Log
+        message: "kubectl scale deploy/{{ inputs.service }} --replicas=10  -> scaled"
+
+      - id: verify_recovery
+        type: io.kestra.plugin.core.log.Log
+        message: "[verify] p99 latency 210ms, error rate 0.2%, 10/10 pods healthy -> recovered"
+
+    else:
+      - id: hand_off_to_oncall
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          No approval granted (rejected, or the gate expired).
+          No production change made. Paging on-call for {{ inputs.service }}.
+
+  # ------------------------------------------------------ 5. AUDIT RECORD --
+  - id: audit_record
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      === INCIDENT RECORD ===
+      Service   : {{ inputs.service }} ({{ outputs.agent_triage.values.severity }})
+      Proposed  : {{ outputs.agent_triage.values.proposed_action }}
+      Decision  : {{ (outputs.approval_gate.onResume is defined and outputs.approval_gate.onResume.approved) ? 'APPROVED' : 'NOT APPROVED' }}
+      Decided at: {{ outputs.approval_gate.resumed.on }}
+      Note      : {{ outputs.approval_gate.onResume is defined ? outputs.approval_gate.onResume.approver_note : 'gate expired with no human decision' }}
+
+triggers:
+  # The flow is a governed tool. An MCP-compatible agent (Claude, Cursor,
+  # Codex) can call it by name - and still lands on the approval gate above.
+  # The annotations tell the agent this action has side effects and is not
+  # safe to retry blindly.
+  - id: mcp
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: respond_to_incident
+    title: Incident response with human approval
+    toolDescription: >-
+      Triage a production incident for a given service and propose a
+      remediation. Gathers infrastructure, data, application and business
+      signals, then requires human approval before any change is applied.
+      Call this when a service is degraded or alerting.
+    annotations:
+      readOnly: false
+      destructive: true
+      idempotent: false
+
+  # Alertmanager / PagerDuty / Datadog webhook entry point.
+  - id: alert_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: replace-with-a-long-random-string

@@ -18,12 +18,106 @@ Two flows, each standalone and each explainable in about a minute:
 
 | Flow | Story | Runs in |
 |---|---|---|
+| [`ai_incident_response`](flows/ai_incident_response.yaml) | **Booth demo** — agentic AI incident response with a human approval gate | ~2s + approval |
 | [`server_health_report`](flows/server_health_report.yaml) | Infrastructure guardrail — check a fleet, page on-call if a host is over budget | ~2s |
 | [`daily_orders_elt`](flows/daily_orders_elt.yaml) | Data pipeline — extract, load, dbt build, quality gate | ~3s |
 
+`ai_incident_response` is the one agreed for the WeAreDevelopers booth in the
+[Demo quick sync](https://docs.google.com/document/d/1mdr7aLlM6Rh3RtU4bZ-DO2A69iWZfMGTAabU49uD86c/edit)
+(Sep 17, 2026). The other two are backups for deeper technical conversations.
+
 ---
 
-## Demo 1: `server_health_report`
+## Booth demo: `ai_incident_response`
+
+[`flows/ai_incident_response.yaml`](flows/ai_incident_response.yaml)
+
+An alert fires. An AI agent gathers context across all four orchestration domains at once, proposes
+a root cause and a remediation — **and then stops**. Nothing touches production until a human
+approves. Kestra executes the approved action deterministically and records the decision.
+
+This is the agentic AI narrative from the messaging brief, made concrete: *"Kestra serves as both an
+execution and governance layer... apply permissions, approval gates, audit trails, monitoring, and
+failure controls to agent actions."* The agent decides; the orchestrator enforces.
+
+### Why this flow, and where it came from
+
+From the Demo quick sync:
+
+- **Fernando** — structure it as "an incident remediation scenario where an agent aggregates data,
+  requests human approval, and executes corrective actions", and show MCP so agents can invoke flows.
+- **Robert** — an AI incident response demo showing data summarization from multiple sources, with
+  dummy data, highlighting governance and granular access control.
+- **Melissa** — one high-impact demo, not several. 30–60 seconds to capture attention; narrated
+  video 1–2 minutes.
+
+Mapped onto the four domains from the messaging brief — the agent reads all of them in parallel,
+which is the unified-orchestration point:
+
+| Domain | What the agent pulls |
+|---|---|
+| Infrastructure automation | pod health, CPU, OOMKills |
+| Data orchestration | upstream pipeline state, schema drift |
+| Application / microservice ops | recent deploys and last stable version |
+| Business process automation | support ticket volume, accounts affected |
+
+### The 60-second booth script
+
+| Beat | Say this | ~Time |
+|---|---|---|
+| 0 | *Hook:* "You know cron jobs? This is cron jobs on steroids." | 5s |
+| 1 | "Checkout is down. One agent pulls context from four places at once — infra, data pipelines, deploys, and the support queue. Most tools only see one of those." | 15s |
+| 2 | "It gives you a root cause, a blast radius, a confidence score, and what it wants to do about it." | 10s |
+| 3 | **"And then it stops."** "The agent is not allowed to touch production. It needs a human." — point at the paused execution | 10s |
+| 4 | Click **Resume**, approve. "Now Kestra runs the rollback — deterministically, with the whole thing on the audit record." | 15s |
+| 5 | "And this flow is registered as an MCP tool. Claude or Cursor can call it directly — and still hits the same approval gate." | 10s |
+
+**The encore.** Reject instead of approving. Nothing happens to production and on-call gets paged.
+Same for a gate that expires — no approval means no change.
+
+### What it demonstrates
+
+- **Human-in-the-loop governance** — `Pause` with `onResume` inputs. The execution genuinely stops;
+  this is the moment that sells the story.
+- **MCP tool registration** — `McpToolTrigger` exposes the flow as a tool named
+  `respond_to_incident`, with annotations (`destructive: true`, `idempotent: false`) that tell the
+  calling agent this has real side effects.
+- **Audit trail** — `Labels` stamps severity, service and agent confidence onto the execution, so
+  incidents are filterable after the fact rather than buried in logs.
+- **Cross-domain context** — `Parallel` fan-out across the four domains.
+- **Fail-safe defaults** — no approval means no production change, whether rejected or timed out.
+
+### Simulated vs. real
+
+The agent reasoning and the remediation calls use dummy data, so it runs anywhere with no model
+credentials and no extra plugins. Each simulated task names what it stands in for:
+
+| Step | Demo uses | Real pipeline uses |
+|---|---|---|
+| Gather context | `log.Log` ×4 in `Parallel` | prometheus / JDBC / GitHub / `servicenow.Get` |
+| Agent triage | `output.OutputValues` | `io.kestra.plugin.ai.agent.AIAgent`, or `ai.completion.JSONStructuredExtraction` to force the schema |
+| Remediation | `log.Log` | the helm / kubernetes / argocd task |
+
+Bring any model, including a self-hosted one — the governance around it does not change.
+
+### Running it
+
+```bash
+AUTH="admin@kestra.io:your-password"
+BASE="http://localhost:8081/api/v1/default"
+
+curl -u "$AUTH" -X POST -F 'd=1' "$BASE/executions/demo.wearedevelopers/ai_incident_response"
+```
+
+The execution runs to the approval gate and sits in `PAUSED`. **Approve it from the UI** — open the
+execution and use the Resume button, which prompts for the `approved` and `approver_note` inputs.
+
+> The gate is set to `pauseDuration: PT1H`. If it expires, the flow takes the not-approved path and
+> ends green rather than hanging or erroring.
+
+---
+
+## Backup demo: `server_health_report`
 
 [`flows/server_health_report.yaml`](flows/server_health_report.yaml) — a nightly infrastructure
 guardrail. It checks every server in a fleet against a CPU threshold, rolls the results into one
@@ -96,7 +190,7 @@ ERROR  CPU budget breached in prod - page the on-call engineer.
 
 ---
 
-## Demo 2: `daily_orders_elt`
+## Backup demo: `daily_orders_elt`
 
 [`flows/daily_orders_elt.yaml`](flows/daily_orders_elt.yaml) — the data-team counterpart: extract
 orders and customers from the app database, load them into the warehouse, transform with dbt, and
@@ -263,7 +357,7 @@ This repo was developed against Kestra EE `2.0.2` in Docker:
 | Tenant | `default` |
 | Namespace | `demo.wearedevelopers` |
 
-Deploy both flows and run them without leaving the terminal:
+Deploy all three flows and run them without leaving the terminal:
 
 ```bash
 AUTH="admin@kestra.io:your-password"
@@ -276,7 +370,10 @@ curl -u "$AUTH" -X POST -F "fileUpload=@flows.zip" "$BASE/flows/import" && rm fl
 # run them
 curl -u "$AUTH" -X POST -F 'd=1' "$BASE/executions/demo.wearedevelopers/server_health_report"
 curl -u "$AUTH" -X POST -F 'd=1' "$BASE/executions/demo.wearedevelopers/daily_orders_elt"
+curl -u "$AUTH" -X POST -F 'd=1' "$BASE/executions/demo.wearedevelopers/ai_incident_response"
 ```
+
+`ai_incident_response` will sit in `PAUSED` until you approve it from the UI.
 
 Then open the execution in the UI to walk the Topology and Gantt views on stage.
 
@@ -303,6 +400,11 @@ Worth knowing if you adapt these examples from older Kestra material:
   and the comparison in the same expression, or push the numbers through `jq` with `tonumber`.
 - `metric.Publish` metrics take `name`, not `id`. Using `id` fails at runtime with the
   unhelpful `No value present`.
+- When a `Pause` auto-resumes on `pauseDuration` expiry, `onResume` is **not populated at all** —
+  not even with the defaults declared on those inputs. An unguarded
+  `{{ outputs.<pause>.onResume.<id> }}` then fails the execution. Guard it with
+  `{{ outputs.<pause>.onResume is defined and ... }}`. `outputs.<pause>.resumed` *is* always
+  populated, as `{"on": <timestamp>, "to": <state>}`.
 
 Full detail: [Kestra 2.0 migration guide](https://kestra.io/docs/migration-guide/v2.0.0) and
 [What's New in 2.0](https://kestra.io/docs/whats-new-2-0).
