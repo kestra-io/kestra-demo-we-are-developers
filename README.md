@@ -18,6 +18,10 @@ gitops/    the bootstrap flow that pulls flows/ into Kestra — not itself synce
 guardrail. It checks every server in a fleet against a CPU threshold, rolls the results into one
 report, and pages the on-call engineer if any host is over budget.
 
+Each host is sized like a real cloud instance — vCPU maxima are powers of two (8, 16, 32, 64) and
+utilization is derived from cores in use over that maximum, so the numbers on screen are ones a
+platform engineer would actually recognize.
+
 It uses **core tasks only** — no credentials, no network calls, no plugins to install. Clone, sync,
 run. It finishes in about two seconds.
 
@@ -26,9 +30,9 @@ run. It finishes in about two seconds.
 | Beat | Say this | ~Time |
 |---|---|---|
 | 1 | "This whole workflow is one YAML file, and it lives in Git — not in the UI." | 5s |
-| 2 | "It takes inputs: which environment, and what CPU threshold counts as too hot." | 10s |
+| 2 | "It takes inputs: which environment, and what percentage of a box's vCPUs counts as too hot." | 10s |
 | 3 | "It loops over the fleet. In Kestra 2.0, **every loop iteration is its own isolated sub-execution** — so looping over 4 servers and looping over 40,000 behave the same way. No single flow can take down the instance." | 15s |
-| 4 | "Each server gets evaluated against the threshold and returns a verdict." | 10s |
+| 4 | "Each server reports cores in use against its vCPU maximum — 13 of 16, 57 of 64 — and we turn that into a verdict." | 10s |
 | 5 | "Then we roll every verdict up into one report — and the guardrail decides whether to page someone." | 10s |
 | 6 | Hit **Execute**. Green. Show the report in the logs. | 10s |
 
@@ -53,10 +57,10 @@ At the default 90% threshold:
 
 ```
 PROD fleet report - 4 servers checked against a 90% threshold.
-  - web-01 at 34% -> OK
-  - web-02 at 85% -> OK
-  - api-01 at 67% -> OK
-  - db-01 at 88% -> OK
+  - web-01 using 3 of 8 vCPU (37%) -> OK
+  - web-02 using 13 of 16 vCPU (81%) -> OK
+  - api-01 using 21 of 32 vCPU (65%) -> OK
+  - db-01 using 57 of 64 vCPU (89%) -> OK
 
 All servers within budget.
 ```
@@ -65,10 +69,10 @@ At an 80% threshold the run **fails on purpose**:
 
 ```
 PROD fleet report - 4 servers checked against a 80% threshold.
-  - web-02 at 85% -> BREACH
-  - db-01 at 88% -> BREACH
-  - api-01 at 67% -> OK
-  - web-01 at 34% -> OK
+  - web-02 using 13 of 16 vCPU (81%) -> BREACH
+  - db-01 using 57 of 64 vCPU (89%) -> BREACH
+  - api-01 using 21 of 32 vCPU (65%) -> OK
+  - web-01 using 3 of 8 vCPU (37%) -> OK
 
 ERROR  CPU budget breached in prod - page the on-call engineer.
 ```
@@ -217,6 +221,11 @@ Worth knowing if you adapt these examples from older Kestra material:
 - Multi-tenancy is mandatory: all flow API routes are `/api/v1/{tenant}/...`.
 - Input `defaults` requires `required: true`. Use `prefill` for optional inputs with a suggested
   starting value.
+- Pebble does **integer division**: `used / vcpus` evaluates to `0`. Multiply before dividing
+  (`used * 100 / vcpus`), which is why the utilization expression is written that way.
+- You cannot compare a task output to a number — `outputs.x.values.y > 90` throws
+  `invalid operands for mathematical comparison`, because outputs are strings. Do the arithmetic
+  and the comparison in the same expression.
 
 Full detail: [Kestra 2.0 migration guide](https://kestra.io/docs/migration-guide/v2.0.0) and
 [What's New in 2.0](https://kestra.io/docs/whats-new-2-0).

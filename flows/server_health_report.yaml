@@ -8,6 +8,9 @@ description: |
   into one report, and pages the on-call engineer if any host is over budget.
   Uses core tasks only - no credentials, no network, no setup.
 
+  Each host is sized like a real cloud instance: vCPU counts are powers of two
+  (8, 16, 32, 64) and utilization is derived from cores in use over that maximum.
+
   At the default 90% threshold the whole fleet is healthy and the run is green.
   Re-run with the threshold at 80 to watch the guardrail catch web-02 and db-01.
 
@@ -32,11 +35,12 @@ inputs:
     defaults: 90
 
 variables:
+  # vcpus is the instance's maximum, always a power of two; used is cores in use.
   fleet:
-    - {host: web-01, cpu: 34}
-    - {host: web-02, cpu: 85}
-    - {host: api-01, cpu: 67}
-    - {host: db-01, cpu: 88}
+    - {host: web-01, vcpus: 8,  used: 3}
+    - {host: web-02, vcpus: 16, used: 13}
+    - {host: api-01, vcpus: 32, used: 21}
+    - {host: db-01,  vcpus: 64, used: 57}
 
 tasks:
   - id: check_servers
@@ -50,18 +54,21 @@ tasks:
         value: "{{ outputs.evaluate.values.status }}"
       - id: line
         type: STRING
-        value: "{{ outputs.evaluate.values.host }} at {{ outputs.evaluate.values.cpu }}% -> {{ outputs.evaluate.values.status }}"
+        value: "{{ outputs.evaluate.values.host }} using {{ outputs.evaluate.values.used }} of {{ outputs.evaluate.values.vcpus }} vCPU ({{ outputs.evaluate.values.utilization }}%) -> {{ outputs.evaluate.values.status }}"
     tasks:
       - id: evaluate
         type: io.kestra.plugin.core.output.OutputValues
         values:
           host: "{{ fromJson(item.value).host }}"
-          cpu: "{{ fromJson(item.value).cpu }}"
-          status: "{{ fromJson(item.value).cpu > inputs.cpu_threshold ? 'BREACH' : 'OK' }}"
+          vcpus: "{{ fromJson(item.value).vcpus }}"
+          used: "{{ fromJson(item.value).used }}"
+          # Multiply before dividing - Pebble does integer division.
+          utilization: "{{ fromJson(item.value).used * 100 / fromJson(item.value).vcpus }}"
+          status: "{{ (fromJson(item.value).used * 100 / fromJson(item.value).vcpus) > inputs.cpu_threshold ? 'BREACH' : 'OK' }}"
 
       - id: log_result
         type: io.kestra.plugin.core.log.Log
-        message: "{{ outputs.evaluate.values.status }} - {{ outputs.evaluate.values.host }} at {{ outputs.evaluate.values.cpu }}% CPU"
+        message: "{{ outputs.evaluate.values.status }} - {{ outputs.evaluate.values.host }} using {{ outputs.evaluate.values.used }} of {{ outputs.evaluate.values.vcpus }} vCPU ({{ outputs.evaluate.values.utilization }}%)"
 
   - id: report
     type: io.kestra.plugin.core.log.Log
