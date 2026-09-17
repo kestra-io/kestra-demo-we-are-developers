@@ -1,0 +1,143 @@
+id: daily_orders_elt
+namespace: demo.wearedevelopers
+
+description: |
+  Daily orders ELT pipeline.
+
+  Extract orders and customers from the app database, load them into the
+  warehouse, transform them with dbt, then gate on data quality before anyone
+  downstream is allowed to trust the result.
+
+  The warehouse and dbt connections are simulated, so this runs anywhere with no
+  credentials and no extra plugins. Every simulated task carries a comment naming
+  the real task type you would swap in - the shape of the pipeline is unchanged.
+
+labels:
+  owner: data-platform
+  demo: we-are-developers
+
+inputs:
+  - id: warehouse
+    type: SELECT
+    displayName: Target warehouse
+    defaults: snowflake
+    values:
+      - label: Snowflake
+        value: snowflake
+      - label: BigQuery
+        value: bigquery
+      - label: Postgres
+        value: postgres
+
+  - id: full_refresh
+    type: BOOL
+    displayName: dbt full refresh
+    defaults: false
+
+variables:
+  # Stands in for what `dbt build` reports back per model.
+  dbt_models:
+    - {name: stg_orders,         rows: 1284}
+    - {name: stg_customers,      rows: 417}
+    - {name: fct_orders,         rows: 1284}
+    - {name: mart_revenue_daily, rows: 30}
+
+tasks:
+  # ---------------------------------------------------------------- EXTRACT --
+  # Both sources are pulled at the same time. In a real pipeline each of these
+  # is io.kestra.plugin.jdbc.postgresql.Query with `fetchType: STORE`, which
+  # lands the result set in Kestra's internal storage exactly like Write does.
+  - id: extract
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: extract_orders
+        type: io.kestra.plugin.core.storage.Write
+        extension: .jsonl
+        content: |
+          {"order_id": 1001, "customer_id": 42, "amount": 129.99, "status": "shipped"}
+          {"order_id": 1002, "customer_id": 17, "amount": 89.50, "status": "shipped"}
+          {"order_id": 1003, "customer_id": 42, "amount": 245.00, "status": "pending"}
+          {"order_id": 1004, "customer_id": 93, "amount": 34.25, "status": "cancelled"}
+          {"order_id": 1005, "customer_id": 17, "amount": 512.75, "status": "shipped"}
+
+      - id: extract_customers
+        type: io.kestra.plugin.core.storage.Write
+        extension: .jsonl
+        content: |
+          {"customer_id": 17, "name": "Acme Corp", "tier": "enterprise"}
+          {"customer_id": 42, "name": "Globex", "tier": "growth"}
+          {"customer_id": 93, "name": "Initech", "tier": "starter"}
+
+  - id: measure_extract
+    type: io.kestra.plugin.core.storage.Size
+    uri: "{{ outputs.extract_orders.uri }}"
+
+  # ------------------------------------------------------------------- LOAD --
+  # Real pipeline: io.kestra.plugin.snowflake.Query (or the bulk-load task for
+  # your warehouse) pointed at the URI produced above.
+  - id: load_to_warehouse
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Loading into {{ inputs.warehouse | upper }}.
+        COPY INTO raw.orders    FROM '{{ outputs.extract_orders.uri }}'    FILE_FORMAT = (TYPE = JSON);
+        COPY INTO raw.customers FROM '{{ outputs.extract_customers.uri }}' FILE_FORMAT = (TYPE = JSON);
+      Staged {{ outputs.measure_extract.size }} bytes of orders.
+
+  # -------------------------------------------------------------- TRANSFORM --
+  # Real pipeline: one io.kestra.plugin.dbt.cli.Build task running the whole
+  # project. Looping model-by-model here makes each model its own node in the
+  # topology, which is what makes the DAG legible on stage.
+  - id: dbt_build
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ vars.dbt_models }}"
+    concurrencyLimit: 1
+    fetchType: FETCH
+    outputs:
+      - id: rows
+        type: STRING
+        value: "{{ fromJson(item.value).rows }}"
+      - id: line
+        type: STRING
+        value: "{{ fromJson(item.value).name }} ({{ fromJson(item.value).rows }} rows)"
+    tasks:
+      - id: build_model
+        type: io.kestra.plugin.core.log.Log
+        message: >-
+          dbt build --select {{ fromJson(item.value).name }}
+          --target {{ inputs.warehouse }}
+          {{ inputs.full_refresh ? '--full-refresh' : '' }}
+          -> OK in {{ fromJson(item.value).rows }} rows
+
+  # ----------------------------------------------------------- QUALITY GATE --
+  # Real pipeline: io.kestra.plugin.dbt.cli.Test, or your warehouse's own
+  # assertions. Nothing downstream runs if these fail.
+  - id: quality_gate
+    type: io.kestra.plugin.core.execution.Assert
+    errorMessage: "Data quality gate failed - holding the {{ inputs.warehouse }} release."
+    conditions:
+      # Every model materialised at least one row.
+      - "{{ loopOutputs(outputs.dbt_build.outputs, 'rows') | jq('map(tonumber) | min > 0') | first }}"
+      # The extract actually produced a file.
+      - "{{ outputs.measure_extract.size > 0 }}"
+
+  - id: publish_metrics
+    type: io.kestra.plugin.core.metric.Publish
+    metrics:
+      - type: counter
+        name: rows_built
+        value: "{{ loopOutputs(outputs.dbt_build.outputs, 'rows') | jq('map(tonumber) | add') | first }}"
+        tags:
+          warehouse: "{{ inputs.warehouse }}"
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ inputs.warehouse | upper }} refreshed - {{ outputs.dbt_build.iterationCount }} models built, quality gate passed.
+      {% for line in loopOutputs(outputs.dbt_build.outputs, 'line') %}  - {{ line }}
+      {% endfor %}
+
+finally:
+  # Staging files are execution-scoped; drop them so internal storage does not
+  # accumulate a copy of every extract, even when the run fails.
+  - id: cleanup
+    type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles

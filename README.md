@@ -12,7 +12,18 @@ gitops/    the bootstrap flow that pulls flows/ into Kestra — not itself synce
 
 ---
 
-## The demo: `server_health_report`
+## The demos
+
+Two flows, each standalone and each explainable in about a minute:
+
+| Flow | Story | Runs in |
+|---|---|---|
+| [`server_health_report`](flows/server_health_report.yaml) | Infrastructure guardrail — check a fleet, page on-call if a host is over budget | ~2s |
+| [`daily_orders_elt`](flows/daily_orders_elt.yaml) | Data pipeline — extract, load, dbt build, quality gate | ~3s |
+
+---
+
+## Demo 1: `server_health_report`
 
 [`flows/server_health_report.yaml`](flows/server_health_report.yaml) — a nightly infrastructure
 guardrail. It checks every server in a fleet against a CPU threshold, rolls the results into one
@@ -82,6 +93,68 @@ ERROR  CPU budget breached in prod - page the on-call engineer.
 
 > Per-server logs live in the **sub-executions**, not the parent. Click into any loop iteration in
 > the Gantt or Topology view to see them. The parent execution shows the rolled-up report.
+
+---
+
+## Demo 2: `daily_orders_elt`
+
+[`flows/daily_orders_elt.yaml`](flows/daily_orders_elt.yaml) — the data-team counterpart: extract
+orders and customers from the app database, load them into the warehouse, transform with dbt, and
+gate on data quality before anyone downstream is allowed to trust the result.
+
+**The warehouse and dbt connections are simulated.** The pipeline runs anywhere with no credentials
+and no extra plugins, and every simulated task carries a comment naming the real task type you would
+swap in. The shape of the pipeline — and everything it demonstrates about Kestra — is unchanged:
+
+| Stage | Demo uses | Real pipeline uses |
+|---|---|---|
+| Extract | `storage.Write` (two sources, in `Parallel`) | `jdbc.postgresql.Query` with `fetchType: STORE` |
+| Load | `log.Log` printing the `COPY INTO` | `snowflake.Query` / your warehouse's bulk load |
+| Transform | `flow.Loop` over the model list | `dbt.cli.Build` |
+| Quality gate | `execution.Assert` | `dbt.cli.Test` |
+
+### The 60-second script
+
+| Beat | Say this | ~Time |
+|---|---|---|
+| 1 | "Two sources, extracted **in parallel** — you can see both branches light up at once." | 10s |
+| 2 | "They land in Kestra's internal storage, and the load step gets the URI. That's a real file — it's in the Outputs tab." | 10s |
+| 3 | "Then dbt builds four models. Each one is its own node, so you can see exactly where a build died." | 10s |
+| 4 | "And here's the part that matters: a **quality gate**. Every model has to produce rows and the extract has to be non-empty, or nothing downstream runs." | 15s |
+| 5 | "Cleanup is in a `finally` block, so staging files get purged even when the run fails." | 10s |
+
+**The encore.** Set any model's `rows` to `0` in the `dbt_models` variable and re-run. The gate
+fails with `Data quality gate failed - holding the snowflake release.`, `publish_metrics` and
+`summary` never run — and `cleanup` still does, because it is in `finally`. That contrast is the
+whole point of the flow.
+
+### What it shows off
+
+- **`Parallel`** — fan out the extracts, no orchestration code.
+- **Internal storage** — `Write` returns a `kestra://` URI that the next task consumes, the same
+  handoff a real query task gives you.
+- **`Assert`** — a first-class data-quality gate. Each condition is logged individually when it fails.
+- **`finally`** — cleanup that runs whether the pipeline succeeded or not.
+- **`metric.Publish`** — row counts land in the execution's Metrics tab, tagged by warehouse.
+
+### Expected output
+
+```
+Loading into SNOWFLAKE.
+  COPY INTO raw.orders    FROM 'kestra:///demo/wearedevelopers/daily-orders-elt/.../...jsonl'    FILE_FORMAT = (TYPE = JSON);
+  COPY INTO raw.customers FROM 'kestra:///demo/wearedevelopers/daily-orders-elt/.../...jsonl' FILE_FORMAT = (TYPE = JSON);
+Staged 385 bytes of orders.
+
+SNOWFLAKE refreshed - 4 models built, quality gate passed.
+  - stg_orders (1284 rows)
+  - stg_customers (417 rows)
+  - fct_orders (1284 rows)
+  - mart_revenue_daily (30 rows)
+```
+
+The `warehouse` input switches the target between Snowflake, BigQuery and Postgres, and
+`full_refresh` toggles `--full-refresh` onto the rendered dbt command — both only change what is
+printed, but they make the point that inputs drive real behaviour.
 
 ---
 
@@ -190,17 +263,19 @@ This repo was developed against Kestra EE `2.0.2` in Docker:
 | Tenant | `default` |
 | Namespace | `demo.wearedevelopers` |
 
-Deploy and run without leaving the terminal:
+Deploy both flows and run them without leaving the terminal:
 
 ```bash
 AUTH="admin@kestra.io:your-password"
+BASE="http://localhost:8081/api/v1/default"
 
-curl -u "$AUTH" -X POST -H 'Content-Type: application/x-yaml' \
-  --data-binary @flows/server_health_report.yaml \
-  "http://localhost:8081/api/v1/default/flows"
+# deploy everything under flows/
+cd flows && zip -qr ../flows.zip . && cd ..
+curl -u "$AUTH" -X POST -F "fileUpload=@flows.zip" "$BASE/flows/import" && rm flows.zip
 
-curl -u "$AUTH" -X POST -F 'dummy=1' \
-  "http://localhost:8081/api/v1/default/executions/demo.wearedevelopers/server_health_report"
+# run them
+curl -u "$AUTH" -X POST -F 'd=1' "$BASE/executions/demo.wearedevelopers/server_health_report"
+curl -u "$AUTH" -X POST -F 'd=1' "$BASE/executions/demo.wearedevelopers/daily_orders_elt"
 ```
 
 Then open the execution in the UI to walk the Topology and Gantt views on stage.
@@ -225,7 +300,9 @@ Worth knowing if you adapt these examples from older Kestra material:
   (`used * 100 / vcpus`), which is why the utilization expression is written that way.
 - You cannot compare a task output to a number — `outputs.x.values.y > 90` throws
   `invalid operands for mathematical comparison`, because outputs are strings. Do the arithmetic
-  and the comparison in the same expression.
+  and the comparison in the same expression, or push the numbers through `jq` with `tonumber`.
+- `metric.Publish` metrics take `name`, not `id`. Using `id` fails at runtime with the
+  unhelpful `No value present`.
 
 Full detail: [Kestra 2.0 migration guide](https://kestra.io/docs/migration-guide/v2.0.0) and
 [What's New in 2.0](https://kestra.io/docs/whats-new-2-0).
