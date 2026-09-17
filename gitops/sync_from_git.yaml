@@ -1,0 +1,36 @@
+id: sync_from_git
+namespace: system
+
+description: |
+  GitOps bootstrap. Pulls every flow under flows/ in this repository into the
+  demo.wearedevelopers namespace. Create this flow once in Kestra (paste it into
+  the UI or POST it to the API); from then on Kestra tracks Git.
+
+  Requires the Git plugin (io.kestra.plugin.git), which ships with the standard
+  kestra/kestra and kestra-ee images. On a -slim image, set
+  KESTRA_PLUGINS_AUTO_INSTALL_ENABLED=true or install plugin-git manually.
+
+tasks:
+  - id: sync_flows
+    type: io.kestra.plugin.git.SyncFlows
+    url: https://github.com/kestra-io/kestra-demo-we-are-developers
+    branch: main
+    username: "{{ secret('GITHUB_USERNAME') }}"
+    password: "{{ secret('GITHUB_ACCESS_TOKEN') }}"
+    gitDirectory: flows
+    targetNamespace: demo.wearedevelopers
+    includeChildNamespaces: true
+    delete: true
+    dryRun: false
+
+triggers:
+  # Poll Git every 15 minutes.
+  - id: every_15_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+  # Or push-based: point a GitHub webhook at
+  # https://<your-kestra-host>/api/v1/<tenant>/executions/webhook/system/sync_from_git/<key>
+  - id: on_git_push
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: replace-with-a-long-random-string

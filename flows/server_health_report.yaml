@@ -1,0 +1,83 @@
+id: server_health_report
+namespace: demo.wearedevelopers
+
+description: |
+  Nightly infrastructure guardrail.
+
+  Checks every server in the fleet against a CPU threshold, rolls the results up
+  into one report, and pages the on-call engineer if any host is over budget.
+  Uses core tasks only - no credentials, no network, no setup.
+
+  At the default 90% threshold the whole fleet is healthy and the run is green.
+  Re-run with the threshold at 80 to watch the guardrail catch web-02 and db-01.
+
+labels:
+  owner: platform-team
+  demo: we-are-developers
+
+inputs:
+  - id: environment
+    type: SELECT
+    displayName: Environment
+    defaults: prod
+    values:
+      - label: Production
+        value: prod
+      - label: Staging
+        value: staging
+
+  - id: cpu_threshold
+    type: INT
+    displayName: CPU alert threshold (%)
+    defaults: 90
+
+variables:
+  fleet:
+    - {host: web-01, cpu: 34}
+    - {host: web-02, cpu: 85}
+    - {host: api-01, cpu: 67}
+    - {host: db-01, cpu: 88}
+
+tasks:
+  - id: check_servers
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ vars.fleet }}"
+    concurrencyLimit: 4
+    fetchType: FETCH
+    outputs:
+      - id: status
+        type: STRING
+        value: "{{ outputs.evaluate.values.status }}"
+      - id: line
+        type: STRING
+        value: "{{ outputs.evaluate.values.host }} at {{ outputs.evaluate.values.cpu }}% -> {{ outputs.evaluate.values.status }}"
+    tasks:
+      - id: evaluate
+        type: io.kestra.plugin.core.output.OutputValues
+        values:
+          host: "{{ fromJson(item.value).host }}"
+          cpu: "{{ fromJson(item.value).cpu }}"
+          status: "{{ fromJson(item.value).cpu > inputs.cpu_threshold ? 'BREACH' : 'OK' }}"
+
+      - id: log_result
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ outputs.evaluate.values.status }} - {{ outputs.evaluate.values.host }} at {{ outputs.evaluate.values.cpu }}% CPU"
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      {{ inputs.environment | upper }} fleet report - {{ outputs.check_servers.iterationCount }} servers checked against a {{ inputs.cpu_threshold }}% threshold.
+      {% for line in loopOutputs(outputs.check_servers.outputs, 'line') %}  - {{ line }}
+      {% endfor %}
+
+  - id: guardrail
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ loopOutputs(outputs.check_servers.outputs, 'status') | jq('[.[] | select(. == \"BREACH\")] | length') | first > 0 }}"
+    then:
+      - id: raise_alert
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "CPU budget breached in {{ inputs.environment }} - page the on-call engineer."
+    else:
+      - id: all_clear
+        type: io.kestra.plugin.core.log.Log
+        message: "All servers within budget."
