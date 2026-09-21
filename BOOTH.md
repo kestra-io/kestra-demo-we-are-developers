@@ -47,7 +47,8 @@ Roughly 90 seconds per visitor.
 4. **Ask for the action.** *"Restart db-01 then."* Claude calls the write tool — **and hangs.**
    The execution is sitting in `PAUSED`.
 5. **Approve in the Kestra UI.** Open the paused execution, hit Resume, fill the approval form.
-   The rollout runs and Claude's answer lands.
+   The rollout runs and Claude's answer lands. Approving has to be done in the UI — the resume API
+   does not accept the approval inputs (see below).
 6. **Land it.** "The agent never got permission to touch production. A human did. And the whole
    thing is on the audit record."
 
@@ -74,22 +75,44 @@ even though the Kestra execution is fine.
 Rehearse the approval click before the floor opens. Target under 30 seconds from Claude calling the
 tool to you hitting Resume — narrate while you walk to the other screen.
 
+**Approve in the UI, not the API.** `POST /executions/{id}/resume` with the approval inputs returns
+404 or 403 on both instances, including with a full instance-owner token, so it is not a permissions
+problem. The bulk endpoint `POST /executions/resume/by-ids` does work but submits no `onResume`
+values, which lands on the not-approved path. The UI form is the only way to actually approve.
+
 The gate is set to `pauseDuration: PT1H`. If a demo gets abandoned, the execution takes the
 not-approved path and ends green rather than hanging or erroring.
 
 ---
 
+## The two instances
+
+Both are deployed and verified. Same six flows, same namespaces, same tool names.
+
+| | Local | Cloud |
+|---|---|---|
+| UI | http://localhost:8081/ui | https://robs-test-org-dev-instance.robs-test-org.kestra.cloud/ui |
+| Tenant | `default` | `main` |
+| MCP URL | `http://localhost:8081/api/v1/default/mcp/default` | `https://robs-test-org-dev-instance.robs-test-org.kestra.cloud/api/v1/main/mcp/default` |
+| Auth | Basic (username/password) | API token (Bearer) |
+
+**Use local as the primary.** No network dependency, and the executions list is yours alone. Cloud
+is the fallback if the laptop has a problem, and the better option if someone wants a link to take
+away.
+
+The cloud tenant is shared — it has 79 other flows in other namespaces. The demo lives in
+`demo.infra` / `demo.data` / `demo.apps` and touches nothing else. Do not bulk-delete executions
+there; the cleanup snippet below filters to `demo.*` for that reason.
+
 ## Connecting Claude Desktop
 
 Claude Desktop does not speak HTTP MCP natively, so the config bridges through `mcp-remote`.
 
-Generate the auth header value:
+**Local** — generate the auth header value first:
 
 ```bash
 echo -n 'admin@kestra.io:YOUR_PASSWORD' | base64
 ```
-
-Then in `claude_desktop_config.json`:
 
 ```json
 {
@@ -106,20 +129,43 @@ Then in `claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop. The six tools appear under the `kestra-local` server.
+**Cloud** — uses the API token directly, no base64:
+
+```json
+{
+  "mcpServers": {
+    "kestra-cloud": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote",
+        "https://robs-test-org-dev-instance.robs-test-org.kestra.cloud/api/v1/main/mcp/default",
+        "--header", "Authorization: Bearer PASTE_TOKEN_HERE"
+      ]
+    }
+  }
+}
+```
+
+The token is in `~/.kestra-cloud-token` on Rob's laptop. Keep it out of the repo and out of
+screenshots.
+
+Restart Claude Desktop after editing. The six tools appear under the server name.
 
 > The `${VAR}` placeholder style shown in Kestra's Connect tab does **not** expand at connection
-> time — paste the literal base64 value.
+> time — paste the literal value.
 
-**Run only one server at a time in the config.** If both local and cloud are connected, Claude sees
-twelve tools with duplicate names and picks unpredictably. Keep the second one commented out or in a
-separate config, and switch deliberately.
+**Run only one server at a time.** If both are connected, Claude sees twelve tools with duplicate
+names and picks unpredictably. Keep the unused one out of the config and switch deliberately.
+
+> The cloud MCP server was set to `API_TOKEN` auth (it ships as `BASIC`, which is unusable on an
+> SSO instance). Nothing else on that tenant uses MCP, so the change affects only this demo.
 
 ---
 
 ## Verifying the connection without Claude
 
-If the tools do not show up, check the server directly:
+If the tools do not show up, check the server directly. This is the local form; for cloud swap
+`-u "$AUTH"` for `-H "Authorization: Bearer $TOKEN"` and use the cloud URL.
 
 ```bash
 AUTH='admin@kestra.io:YOUR_PASSWORD'
@@ -146,13 +192,15 @@ Six tools in the response means the booth demo will work.
 Nothing needs resetting — the flows are stateless and the mock data is fixed, so every visitor sees
 the same problem and the same fix.
 
-To clear the Executions list so it looks tidy:
+To clear the Executions list so it looks tidy. Note the `demo.` filter — on cloud the tenant is
+shared, so never delete unfiltered:
 
 ```bash
 AUTH='admin@kestra.io:YOUR_PASSWORD'
 BASE='http://localhost:8081/api/v1/default'
-IDS=$(curl -s -u "$AUTH" "$BASE/executions/search?size=200" \
-  | python3 -c "import sys,json;print(json.dumps([e['id'] for e in json.load(sys.stdin)['results']]))")
+IDS=$(curl -s -u "$AUTH" "$BASE/executions/search?size=200" | python3 -c "
+import sys,json
+print(json.dumps([e['id'] for e in json.load(sys.stdin)['results'] if e['namespace'].startswith('demo.')]))")
 curl -s -u "$AUTH" -X DELETE -H 'Content-Type: application/json' -d "$IDS" "$BASE/executions/by-ids"
 ```
 

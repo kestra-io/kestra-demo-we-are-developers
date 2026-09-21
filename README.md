@@ -6,6 +6,8 @@ The booth demo is six flows across three domains, all exposed as MCP tools and d
 Desktop. A visitor picks their domain; we run the read tool to answer a question, then the write
 tool, which stops for human approval before it changes anything.
 
+Deployed and verified on both the local EE instance and the cloud instance.
+
 **[BOOTH.md](BOOTH.md) is the operator guide** - tool list, Claude Desktop config, run of show, and
 the one thing that can break the demo. Read that before the floor opens.
 
@@ -152,15 +154,20 @@ requires provider version `~> 2.0`.
 
 ---
 
+## Where it is deployed
+
+| | Local | Cloud |
+|---|---|---|
+| UI | http://localhost:8081/ui | https://robs-test-org-dev-instance.robs-test-org.kestra.cloud/ui |
+| Version | Kestra EE 2.0.2 (Docker) | Kestra Cloud |
+| Tenant | `default` | `main` |
+| Auth | Basic | API token (Bearer) |
+| Namespaces | `demo.infra`, `demo.data`, `demo.apps` | same |
+
+The cloud tenant is shared with 79 unrelated flows; the demo is additive and confined to the
+`demo.*` namespaces.
+
 ## Running the demo locally
-
-This repo was developed against Kestra EE `2.0.2` in Docker:
-
-| | |
-|---|---|
-| UI | http://localhost:8081/ui |
-| Tenant | `default` |
-| Namespaces | `demo.infra`, `demo.data`, `demo.apps` |
 
 Deploy all six flows and run them without leaving the terminal:
 
