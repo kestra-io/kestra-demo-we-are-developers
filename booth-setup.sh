@@ -27,6 +27,9 @@ BRANCH="main"
 BASE="http://localhost:${PORT}/api/v1/${TENANT}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKDIR="${HOME}/.kestra-booth"
+SCRATCH=""
+cleanup() { [[ -n "${SCRATCH}" ]] && rm -rf "${SCRATCH}"; return 0; }
+trap cleanup EXIT
 
 bold() { printf "\033[1m%s\033[0m\n" "$1"; }
 ok()   { printf "  \033[32mok\033[0m  %s\n" "$1"; }
@@ -96,7 +99,7 @@ pull_image() {
 
   info "Pulling ${IMAGE} (a few minutes the first time)..."
   docker pull "${IMAGE}" >/dev/null || die "Could not pull the Enterprise image."
-  ok "Image ready: $(docker image inspect "${IMAGE}" --format '{{index .RepoTags 0}}')"
+  ok "Image ready: ${IMAGE}"
 }
 
 # ------------------------------------------------------------------ config --
@@ -153,11 +156,12 @@ start_container() {
   ok "Container ${CONTAINER} started on port ${PORT}"
 }
 
+# Waits on /me, which does not need a tenant to exist yet.
 wait_ready() {
   info "Waiting for Kestra to come up (up to 3 minutes)..."
   local i code
   for i in $(seq 1 90); do
-    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' -u "${ADMIN_USER}:${ADMIN_PASS}" "${BASE}/flows/search?size=1" || true)"
+    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' -u "${ADMIN_USER}:${ADMIN_PASS}" "http://localhost:${PORT}/api/v1/me" || true)"
     if [[ "$code" == "200" ]]; then ok "Kestra is up"; return 0; fi
     if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
       docker logs --tail 40 "${CONTAINER}" >&2 || true
@@ -169,18 +173,65 @@ wait_ready() {
   die "Kestra did not become ready in time. Log above; full log: docker logs ${CONTAINER}"
 }
 
+# Since 0.23 tenants are mandatory and are not created automatically. Without
+# this the UI would open on the first-run setup wizard and every tenant-scoped
+# API call would 404.
+ensure_tenant() {
+  local code
+  code="$(curl -s -o /dev/null -m 15 -w '%{http_code}' -u "${ADMIN_USER}:${ADMIN_PASS}" \
+    -X POST -H 'Content-Type: application/json' \
+    -d "{\"id\":\"${TENANT}\",\"name\":\"Booth demo\"}" \
+    "http://localhost:${PORT}/api/v1/tenants" || true)"
+  case "$code" in
+    200|201) ok "Created tenant '${TENANT}'" ;;
+    422)     ok "Tenant '${TENANT}' already exists" ;;
+    *)       die "Could not create the tenant (HTTP ${code}). Check: docker logs ${CONTAINER}" ;;
+  esac
+
+  local i
+  for i in $(seq 1 30); do
+    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' -u "${ADMIN_USER}:${ADMIN_PASS}" "${BASE}/flows/search?size=1" || true)"
+    [[ "$code" == "200" ]] && return 0
+    sleep 2
+  done
+  die "The tenant exists but the flows API is not responding."
+}
+
 # ------------------------------------------------------------------- flows --
 deploy_flows() {
   local tmp; tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
+  SCRATCH="$tmp"
 
-  info "Downloading flows from ${REPO}@${BRANCH}..."
-  curl -fsSL "https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}" \
-    | tar -xz -C "$tmp" 2>/dev/null \
-    || die "Could not download the flows. Check your internet connection."
+  # The repository is private, so try git first - it reuses the access you
+  # already have from cloning. The tarball path only works if the repo is
+  # public or GITHUB_TOKEN is set. Falling back to the checkout next to this
+  # script means the demo still comes up with no network at all.
+  local dir=""
 
-  local dir; dir="$(find "$tmp" -type d -name flows -maxdepth 2 | head -1)"
-  [[ -n "$dir" ]] || die "No flows/ directory in the repository archive."
+  if command -v git >/dev/null 2>&1; then
+    info "Fetching flows from ${REPO}@${BRANCH} via git..."
+    if git clone --depth 1 --branch "${BRANCH}" --quiet \
+         "https://github.com/${REPO}.git" "$tmp/repo" 2>/dev/null; then
+      dir="$tmp/repo/flows"
+    fi
+  fi
+
+  if [[ -z "$dir" || ! -d "$dir" ]]; then
+    info "Trying a direct download..."
+    local auth=()
+    [[ -n "${GITHUB_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+    if curl -fsSL "${auth[@]}" "https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}" \
+         | tar -xz -C "$tmp" 2>/dev/null; then
+      dir="$(find "$tmp" -maxdepth 2 -type d -name flows | head -1)"
+    fi
+  fi
+
+  if [[ -z "$dir" || ! -d "$dir" ]] && [[ -d "${HERE}/flows" ]]; then
+    warn "Could not reach GitHub - using the flows/ folder next to this script."
+    dir="${HERE}/flows"
+  fi
+
+  [[ -n "$dir" && -d "$dir" ]] || die "Could not get the flows. You need access to the ${REPO} repository: run 'git clone https://github.com/${REPO}.git' once, then re-run this script from inside it."
 
   local n=0 f code
   for f in "$dir"/*.yaml "$dir"/*.yml; do
@@ -197,27 +248,39 @@ deploy_flows() {
   ok "Imported ${n} flows"
 }
 
+# Never fatal: the flows are already deployed by this point, this is a sanity
+# check that the MCP server picked them up.
 verify_tools() {
   local url="http://localhost:${PORT}/api/v1/${TENANT}/mcp/default"
-  local sid
-  sid="$(curl -s -m 20 -D - -o /dev/null -u "${ADMIN_USER}:${ADMIN_PASS}" \
-      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-      -X POST -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"setup","version":"1"}}}' \
-      "$url" 2>/dev/null | grep -i 'mcp-session-id' | tr -d '\r' | awk '{print $2}')"
-  if [[ -z "$sid" ]]; then warn "Could not reach the MCP server to count tools (the flows are still deployed)."; return 0; fi
+  local sid="" count="0" i
+
+  for i in $(seq 1 10); do
+    sid="$(curl -s -m 20 -D - -o /dev/null -u "${ADMIN_USER}:${ADMIN_PASS}" \
+        -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+        -X POST -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"setup","version":"1"}}}' \
+        "$url" 2>/dev/null | grep -i 'mcp-session-id' | tr -d '\r' | awk '{print $2}' || true)"
+    [[ -n "$sid" ]] && break
+    sleep 2
+  done
+
+  if [[ -z "$sid" ]]; then
+    warn "Could not reach the MCP server to count tools. The flows are deployed - check the Flows page in the UI."
+    return 0
+  fi
 
   curl -s -m 15 -u "${ADMIN_USER}:${ADMIN_PASS}" -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' -H "Mcp-Session-Id: $sid" \
-    -X POST -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$url" >/dev/null 2>&1
+    -X POST -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$url" >/dev/null 2>&1 || true
 
-  local count
   count="$(curl -s -m 20 -u "${ADMIN_USER}:${ADMIN_PASS}" -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' -H "Mcp-Session-Id: $sid" \
     -X POST -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$url" 2>/dev/null \
     | tr ',' '\n' | grep -c '"name"' || true)"
+  count="${count//[^0-9]/}"; count="${count:-0}"
 
-  if [[ "${count:-0}" -ge 6 ]]; then ok "MCP server is serving ${count} tools"
-  else warn "MCP reported ${count:-0} tools, expected 6. Check the Flows page in the UI."; fi
+  if [[ "$count" -ge 6 ]]; then ok "MCP server is serving ${count} tools"
+  else warn "MCP reported ${count} tools, expected 6. Check the Flows page in the UI."; fi
+  return 0
 }
 
 summary() {
@@ -251,16 +314,18 @@ cmd_up() {
   write_config
   start_container
   wait_ready
+  ensure_tenant
   deploy_flows
-  verify_tools
+  verify_tools || true
   summary
 }
 
 cmd_flows() {
   preflight
   wait_ready
+  ensure_tenant
   deploy_flows
-  verify_tools
+  verify_tools || true
   echo
 }
 
