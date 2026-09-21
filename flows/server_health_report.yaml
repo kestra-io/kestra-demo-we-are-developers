@@ -1,27 +1,21 @@
 id: server_health_report
-namespace: demo.wearedevelopers
+namespace: demo.infra
 
 description: |
-  Nightly infrastructure guardrail.
+  READ tool. Reports CPU utilization across the fleet against a threshold.
 
-  Checks every server in the fleet against a CPU threshold, rolls the results up
-  into one report, and pages the on-call engineer if any host is over budget.
-  Uses core tasks only - no credentials, no network, no setup.
-
-  Each host is sized like a real cloud instance: vCPU counts are powers of two
-  (8, 16, 32, 64) and utilization is derived from cores in use over that maximum.
-
-  At the default 90% threshold the whole fleet is healthy and the run is green.
-  Re-run with the threshold at 80 to watch the guardrail catch web-02 and db-01.
+  Booth pair: ask this first, then ask for `restart_host` on whatever it flags.
+  Fleet data is mocked - swap the loop source for your real inventory.
 
 labels:
-  owner: platform-team
-  demo: we-are-developers
+  domain: infra
+  booth: read
 
 inputs:
   - id: environment
     type: SELECT
     displayName: Environment
+    description: Which environment's fleet to inspect. Defaults to prod.
     defaults: prod
     values:
       - label: Production
@@ -32,10 +26,11 @@ inputs:
   - id: cpu_threshold
     type: INT
     displayName: CPU alert threshold (%)
-    defaults: 90
+    description: Utilization percentage above which a host is reported as a breach. Defaults to 80.
+    defaults: 80
 
 variables:
-  # vcpus is the instance's maximum, always a power of two; used is cores in use.
+  # vcpus is the instance maximum, always a power of two; used is cores in use.
   fleet:
     - {host: web-01, vcpus: 8,  used: 3}
     - {host: web-02, vcpus: 16, used: 13}
@@ -66,25 +61,47 @@ tasks:
           utilization: "{{ fromJson(item.value).used * 100 / fromJson(item.value).vcpus }}"
           status: "{{ (fromJson(item.value).used * 100 / fromJson(item.value).vcpus) > inputs.cpu_threshold ? 'BREACH' : 'OK' }}"
 
-      - id: log_result
-        type: io.kestra.plugin.core.log.Log
-        message: "{{ outputs.evaluate.values.status }} - {{ outputs.evaluate.values.host }} using {{ outputs.evaluate.values.used }} of {{ outputs.evaluate.values.vcpus }} vCPU ({{ outputs.evaluate.values.utilization }}%)"
+  - id: summarise
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      breaches: "{{ loopOutputs(outputs.check_servers.outputs, 'status') | jq('[.[] | select(. == \"BREACH\")] | length') | first }}"
+      detail: |
+        {% for line in loopOutputs(outputs.check_servers.outputs, 'line') %}- {{ line }}
+        {% endfor %}
 
   - id: report
     type: io.kestra.plugin.core.log.Log
     message: |
-      {{ inputs.environment | upper }} fleet report - {{ outputs.check_servers.iterationCount }} servers checked against a {{ inputs.cpu_threshold }}% threshold.
-      {% for line in loopOutputs(outputs.check_servers.outputs, 'line') %}  - {{ line }}
-      {% endfor %}
+      {{ inputs.environment | upper }} fleet - {{ outputs.check_servers.iterationCount }} hosts checked against {{ inputs.cpu_threshold }}%, {{ outputs.summarise.values.breaches }} over budget.
+      {{ outputs.summarise.values.detail }}
 
-  - id: guardrail
-    type: io.kestra.plugin.core.flow.If
-    condition: "{{ loopOutputs(outputs.check_servers.outputs, 'status') | jq('[.[] | select(. == \"BREACH\")] | length') | first > 0 }}"
-    then:
-      - id: raise_alert
-        type: io.kestra.plugin.core.execution.Fail
-        errorMessage: "CPU budget breached in {{ inputs.environment }} - page the on-call engineer."
-    else:
-      - id: all_clear
-        type: io.kestra.plugin.core.log.Log
-        message: "All servers within budget."
+outputs:
+  - id: summary
+    type: STRING
+    displayName: Summary
+    value: "{{ inputs.environment | upper }} fleet: {{ outputs.check_servers.iterationCount }} hosts checked against a {{ inputs.cpu_threshold }}% CPU threshold, {{ outputs.summarise.values.breaches }} over budget."
+
+  - id: hosts
+    type: STRING
+    displayName: Per-host detail
+    value: "{{ outputs.summarise.values.detail }}"
+
+  - id: breach_count
+    type: INT
+    displayName: Hosts over threshold
+    value: "{{ outputs.summarise.values.breaches }}"
+
+triggers:
+  - id: mcp
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: get_server_health
+    title: Server health report
+    toolDescription: >-
+      Reports CPU utilization for every host in the fleet and flags any host over
+      a threshold. Read-only - it inspects but never changes anything. Call this
+      when asked how the servers, hosts or fleet are doing, or which machines are
+      running hot. To actually restart a host afterwards, use restart_host.
+    annotations:
+      readOnly: true
+      destructive: false
+      idempotent: true

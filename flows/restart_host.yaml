@@ -1,0 +1,118 @@
+id: restart_host
+namespace: demo.infra
+
+description: |
+  WRITE tool. Restarts a fleet host - behind a human approval gate.
+
+  Booth pair: run `server_health_report` first, then ask to restart whatever it
+  flagged. The execution pauses; approve it in the UI and it completes.
+  The restart itself is mocked - swap for your ssh, ansible or cloud task.
+
+labels:
+  domain: infra
+  booth: write
+
+inputs:
+  - id: host
+    type: SELECT
+    displayName: Host
+    description: The hostname to restart, for example db-01. Must be a host in the fleet.
+    defaults: db-01
+    values:
+      - label: web-01
+        value: web-01
+      - label: web-02
+        value: web-02
+      - label: api-01
+        value: api-01
+      - label: db-01
+        value: db-01
+
+  - id: reason
+    type: STRING
+    displayName: Reason
+    description: Why the restart is needed. Recorded on the approval and in the audit trail.
+    defaults: Sustained CPU over threshold
+
+tasks:
+  # Real pipeline: the ssh, ansible or cloud provider task that drains traffic.
+  - id: preflight
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      connections: "1284"
+      drain_seconds: "30"
+      replica_available: "yes"
+
+  - id: plan
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      === RESTART PLAN: {{ inputs.host }} ===
+      Reason           : {{ inputs.reason }}
+      Active conns     : {{ outputs.preflight.values.connections }} (drain {{ outputs.preflight.values.drain_seconds }}s first)
+      Standby replica  : {{ outputs.preflight.values.replica_available }}
+      Awaiting human approval - nothing has been touched yet.
+
+  - id: approval_gate
+    type: io.kestra.plugin.core.flow.Pause
+    pauseDuration: PT1H
+    onResume:
+      - id: approved
+        displayName: Approve the restart?
+        type: BOOL
+        defaults: true
+      - id: approver_note
+        displayName: Note for the audit record
+        type: STRING
+        defaults: Confirmed standby replica is healthy.
+
+  - id: decision
+    type: io.kestra.plugin.core.flow.If
+    # Guarded: on gate expiry onResume is never populated, not even with the
+    # defaults above. No approval means no restart.
+    condition: "{{ outputs.approval_gate.onResume is defined and outputs.approval_gate.onResume.approved }}"
+    then:
+      - id: drain
+        type: io.kestra.plugin.core.log.Log
+        message: "[1/3] draining {{ outputs.preflight.values.connections }} connections from {{ inputs.host }} -> drained"
+      - id: restart
+        type: io.kestra.plugin.core.log.Log
+        message: "[2/3] systemctl reboot {{ inputs.host }} -> back up in 41s"
+      - id: verify
+        type: io.kestra.plugin.core.log.Log
+        message: "[3/3] health check {{ inputs.host }} -> passing, traffic restored"
+    else:
+      - id: aborted
+        type: io.kestra.plugin.core.log.Log
+        message: "Restart of {{ inputs.host }} NOT approved. No change made."
+
+  - id: record
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      outcome: "{{ (outputs.approval_gate.onResume is defined and outputs.approval_gate.onResume.approved) ? 'RESTARTED' : 'NOT APPROVED' }}"
+      note: "{{ outputs.approval_gate.onResume is defined ? outputs.approval_gate.onResume.approver_note : 'approval gate expired with no decision' }}"
+
+outputs:
+  - id: outcome
+    type: STRING
+    displayName: Outcome
+    value: "{{ outputs.record.values.outcome }}"
+
+  - id: summary
+    type: STRING
+    displayName: Summary
+    value: "{{ inputs.host }}: {{ outputs.record.values.outcome }} at {{ outputs.approval_gate.resumed.on }}. Note: {{ outputs.record.values.note }}"
+
+triggers:
+  - id: mcp
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: restart_host
+    title: Restart a fleet host
+    toolDescription: >-
+      Restarts a single host in the fleet, draining connections first. This
+      changes production and REQUIRES human approval - the execution pauses until
+      someone approves it in Kestra, so the result is not immediate. Call this
+      when asked to restart, reboot or recycle a specific host.
+    annotations:
+      readOnly: false
+      destructive: true
+      idempotent: false

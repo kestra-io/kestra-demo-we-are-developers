@@ -1,0 +1,99 @@
+id: service_status
+namespace: demo.apps
+
+description: |
+  READ tool. Reports health, version and error rates for the application services.
+
+  Booth pair: ask this first, then ask to `restart_service` on whatever it flags.
+  Service telemetry is mocked - swap for your Prometheus, Datadog or k8s tasks.
+
+labels:
+  domain: apps
+  booth: read
+
+inputs:
+  - id: service
+    type: SELECT
+    displayName: Service
+    description: Which service to report on, or "all" for every service.
+    defaults: all
+    values:
+      - label: All services
+        value: all
+      - label: checkout-api
+        value: checkout-api
+      - label: payments-worker
+        value: payments-worker
+      - label: search-api
+        value: search-api
+
+variables:
+  services:
+    - {name: checkout-api,    version: "v2.14.0", replicas: "6/8",  p99_ms: 4200, error_pct: "12.4", state: DEGRADED, note: "memory leak since v2.14.0, 3 OOMKills in 10min"}
+    - {name: payments-worker, version: "v1.9.2",  replicas: "4/4",  p99_ms: 180,  error_pct: "0.1",  state: HEALTHY,  note: "nominal"}
+    - {name: search-api,      version: "v3.2.1",  replicas: "3/3",  p99_ms: 240,  error_pct: "0.3",  state: HEALTHY,  note: "nominal"}
+
+tasks:
+  - id: inspect
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ vars.services }}"
+    concurrencyLimit: 3
+    fetchType: FETCH
+    outputs:
+      - id: state
+        type: STRING
+        value: "{{ fromJson(item.value).state }}"
+      - id: line
+        type: STRING
+        value: "{{ fromJson(item.value).name }} [{{ fromJson(item.value).state }}] {{ fromJson(item.value).version }}, {{ fromJson(item.value).replicas }} replicas, p99 {{ fromJson(item.value).p99_ms }}ms, {{ fromJson(item.value).error_pct }}% errors - {{ fromJson(item.value).note }}"
+    tasks:
+      # Real pipeline: prometheus.Query or a kubernetes task for pod state.
+      - id: probe
+        type: io.kestra.plugin.core.log.Log
+        message: "probing {{ fromJson(item.value).name }}"
+
+  - id: summarise
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      degraded: "{{ loopOutputs(outputs.inspect.outputs, 'state') | jq('[.[] | select(. != \"HEALTHY\")] | length') | first }}"
+      detail: |
+        {% for line in loopOutputs(outputs.inspect.outputs, 'line') %}- {{ line }}
+        {% endfor %}
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Service status ({{ inputs.service }}) - {{ outputs.inspect.iterationCount }} services, {{ outputs.summarise.values.degraded }} degraded.
+      {{ outputs.summarise.values.detail }}
+
+outputs:
+  - id: summary
+    type: STRING
+    displayName: Summary
+    value: "{{ outputs.inspect.iterationCount }} services checked, {{ outputs.summarise.values.degraded }} degraded. checkout-api is the problem: p99 is 4200ms with a 12.4% error rate, and it has been leaking memory since v2.14.0 shipped."
+
+  - id: services
+    type: STRING
+    displayName: Per-service detail
+    value: "{{ outputs.summarise.values.detail }}"
+
+  - id: degraded_count
+    type: INT
+    displayName: Degraded services
+    value: "{{ outputs.summarise.values.degraded }}"
+
+triggers:
+  - id: mcp
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: get_service_status
+    title: Application service status
+    toolDescription: >-
+      Reports health, deployed version, replica counts, latency and error rates
+      for the application services. Read-only - it inspects but never changes
+      anything. Call this when asked how the services, apps or APIs are doing,
+      what is deployed, or why something is slow or erroring. To restart a
+      service afterwards, use restart_service.
+    annotations:
+      readOnly: true
+      destructive: false
+      idempotent: true

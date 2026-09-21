@@ -1,0 +1,101 @@
+id: pipeline_status
+namespace: demo.data
+
+description: |
+  READ tool. Reports the health and freshness of the data pipelines.
+
+  Booth pair: ask this first, then ask to `backfill_orders` for the gap it finds.
+  Run history is mocked - swap for a query against your warehouse or
+  Kestra's own execution API.
+
+labels:
+  domain: data
+  booth: read
+
+inputs:
+  - id: pipeline
+    type: SELECT
+    displayName: Pipeline
+    description: Which pipeline to report on, or "all" for the whole estate.
+    defaults: all
+    values:
+      - label: All pipelines
+        value: all
+      - label: orders_elt
+        value: orders_elt
+      - label: customers_sync
+        value: customers_sync
+      - label: revenue_daily
+        value: revenue_daily
+
+variables:
+  pipelines:
+    - {name: orders_elt,     state: FAILED,  last_run: "2026-09-19T02:14Z", rows: 0,      freshness_h: 31, note: "source API 503 on 3 retries"}
+    - {name: customers_sync, state: SUCCESS, last_run: "2026-09-20T02:05Z", rows: 4173,   freshness_h: 7,  note: "nominal"}
+    - {name: revenue_daily,  state: SUCCESS, last_run: "2026-09-20T03:00Z", rows: 30,     freshness_h: 6,  note: "nominal"}
+
+tasks:
+  - id: inspect
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ vars.pipelines }}"
+    concurrencyLimit: 3
+    fetchType: FETCH
+    outputs:
+      - id: state
+        type: STRING
+        value: "{{ fromJson(item.value).state }}"
+      - id: line
+        type: STRING
+        value: "{{ fromJson(item.value).name }} [{{ fromJson(item.value).state }}] last run {{ fromJson(item.value).last_run }}, {{ fromJson(item.value).rows }} rows, {{ fromJson(item.value).freshness_h }}h stale - {{ fromJson(item.value).note }}"
+    tasks:
+      # Real pipeline: a JDBC query against your warehouse audit table, or
+      # io.kestra.plugin.core.http.Request against Kestra's executions API.
+      - id: probe
+        type: io.kestra.plugin.core.log.Log
+        message: "probing {{ fromJson(item.value).name }}"
+
+  - id: summarise
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      failed: "{{ loopOutputs(outputs.inspect.outputs, 'state') | jq('[.[] | select(. == \"FAILED\")] | length') | first }}"
+      detail: |
+        {% for line in loopOutputs(outputs.inspect.outputs, 'line') %}- {{ line }}
+        {% endfor %}
+
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Pipeline status ({{ inputs.pipeline }}) - {{ outputs.inspect.iterationCount }} pipelines, {{ outputs.summarise.values.failed }} failing.
+      {{ outputs.summarise.values.detail }}
+
+outputs:
+  - id: summary
+    type: STRING
+    displayName: Summary
+    value: "{{ outputs.inspect.iterationCount }} pipelines checked, {{ outputs.summarise.values.failed }} failing. orders_elt is the one to worry about: it last succeeded 31 hours ago, so 2026-09-19 has no orders data."
+
+  - id: pipelines
+    type: STRING
+    displayName: Per-pipeline detail
+    value: "{{ outputs.summarise.values.detail }}"
+
+  - id: failed_count
+    type: INT
+    displayName: Failing pipelines
+    value: "{{ outputs.summarise.values.failed }}"
+
+triggers:
+  - id: mcp
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: get_pipeline_status
+    title: Data pipeline status
+    toolDescription: >-
+      Reports the last run state, row counts and data freshness for the data
+      pipelines, and identifies gaps where data is missing. Read-only - it
+      inspects but never changes anything. Call this when asked how the data
+      pipelines, ETL jobs or data freshness are doing, or whether data is
+      missing. To fill a gap afterwards, use backfill_orders.
+    annotations:
+      readOnly: true
+      destructive: false
+      idempotent: true

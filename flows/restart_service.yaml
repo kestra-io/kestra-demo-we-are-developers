@@ -1,0 +1,129 @@
+id: restart_service
+namespace: demo.apps
+
+description: |
+  WRITE tool. Restarts an application service - behind a human approval gate.
+
+  Booth pair: run `service_status` first, then ask to restart whatever it
+  flagged. The execution pauses; approve it in the UI and it completes.
+  The rollout is mocked - swap for your kubernetes, helm or argocd tasks.
+
+labels:
+  domain: apps
+  booth: write
+
+inputs:
+  - id: service
+    type: SELECT
+    displayName: Service
+    description: The service to restart, for example checkout-api.
+    defaults: checkout-api
+    values:
+      - label: checkout-api
+        value: checkout-api
+      - label: payments-worker
+        value: payments-worker
+      - label: search-api
+        value: search-api
+
+  - id: strategy
+    type: SELECT
+    displayName: Restart strategy
+    description: >-
+      rolling keeps the service available by replacing pods one at a time.
+      recreate takes the whole service down first and causes downtime.
+    defaults: rolling
+    values:
+      - label: Rolling (no downtime)
+        value: rolling
+      - label: Recreate (causes downtime)
+        value: recreate
+
+  - id: reason
+    type: STRING
+    displayName: Reason
+    description: Why the restart is needed. Recorded on the approval and in the audit trail.
+    defaults: Memory leak in v2.14.0, reclaim heap
+
+tasks:
+  # Real pipeline: a kubernetes task reading the live deployment spec, so the
+  # approver sees the actual blast radius rather than an assumption.
+  - id: preflight
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      replicas: "8"
+      in_flight: "213"
+      downtime: "{{ inputs.strategy == 'recreate' ? 'YES - full outage for ~40s' : 'none - pods replaced one at a time' }}"
+
+  - id: plan
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      === RESTART PLAN: {{ inputs.service }} ===
+      Reason         : {{ inputs.reason }}
+      Strategy       : {{ inputs.strategy }}
+      Replicas       : {{ outputs.preflight.values.replicas }}
+      In-flight reqs : {{ outputs.preflight.values.in_flight }}
+      Downtime       : {{ outputs.preflight.values.downtime }}
+      Awaiting human approval - nothing has been rolled yet.
+
+  - id: approval_gate
+    type: io.kestra.plugin.core.flow.Pause
+    pauseDuration: PT1H
+    onResume:
+      - id: approved
+        displayName: Approve the restart?
+        type: BOOL
+        defaults: true
+      - id: approver_note
+        displayName: Note for the audit record
+        type: STRING
+        defaults: Rolling restart approved, no downtime expected.
+
+  - id: decision
+    type: io.kestra.plugin.core.flow.If
+    # Guarded: on gate expiry onResume is never populated, not even with the
+    # defaults above. No approval means no rollout.
+    condition: "{{ outputs.approval_gate.onResume is defined and outputs.approval_gate.onResume.approved }}"
+    then:
+      - id: rollout
+        type: io.kestra.plugin.core.log.Log
+        message: "kubectl rollout restart deploy/{{ inputs.service }} --strategy={{ inputs.strategy }} -> 8/8 pods replaced"
+      - id: verify
+        type: io.kestra.plugin.core.log.Log
+        message: "[verify] {{ inputs.service }} p99 210ms, error rate 0.2%, 8/8 healthy -> recovered"
+    else:
+      - id: aborted
+        type: io.kestra.plugin.core.log.Log
+        message: "Restart of {{ inputs.service }} NOT approved. No rollout performed."
+
+  - id: record
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      outcome: "{{ (outputs.approval_gate.onResume is defined and outputs.approval_gate.onResume.approved) ? 'RESTARTED' : 'NOT APPROVED' }}"
+      note: "{{ outputs.approval_gate.onResume is defined ? outputs.approval_gate.onResume.approver_note : 'approval gate expired with no decision' }}"
+
+outputs:
+  - id: outcome
+    type: STRING
+    displayName: Outcome
+    value: "{{ outputs.record.values.outcome }}"
+
+  - id: summary
+    type: STRING
+    displayName: Summary
+    value: "{{ inputs.service }} ({{ inputs.strategy }}): {{ outputs.record.values.outcome }} at {{ outputs.approval_gate.resumed.on }}. Note: {{ outputs.record.values.note }}"
+
+triggers:
+  - id: mcp
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: restart_service
+    title: Restart an application service
+    toolDescription: >-
+      Restarts an application service, either rolling (no downtime) or recreate
+      (causes downtime). This changes production and REQUIRES human approval -
+      the execution pauses until someone approves it in Kestra, so the result is
+      not immediate. Call this when asked to restart, roll or recycle a service.
+    annotations:
+      readOnly: false
+      destructive: true
+      idempotent: false

@@ -1,0 +1,128 @@
+id: backfill_orders
+namespace: demo.data
+
+description: |
+  WRITE tool. Backfills the orders pipeline for a date range - behind a human
+  approval gate.
+
+  Booth pair: run `pipeline_status` first, then ask to backfill the gap it
+  found (2026-09-19). The execution pauses; approve it in the UI and it runs.
+  The warehouse writes are mocked - swap for your dbt or JDBC tasks.
+
+labels:
+  domain: data
+  booth: write
+
+inputs:
+  - id: start_date
+    type: DATE
+    displayName: Start date
+    description: First date to backfill, inclusive. Format YYYY-MM-DD.
+    defaults: 2026-09-19
+
+  - id: end_date
+    type: DATE
+    displayName: End date
+    description: Last date to backfill, inclusive. Format YYYY-MM-DD.
+    defaults: 2026-09-19
+
+  - id: full_refresh
+    type: BOOL
+    displayName: Full refresh
+    description: Rebuild the partitions from scratch instead of merging. Slower and more destructive.
+    defaults: false
+
+variables:
+  partitions:
+    - {date: "2026-09-19", rows: 1284}
+
+tasks:
+  # Real pipeline: a COUNT query against the source to size the job before
+  # anyone approves it. Estimating first is what makes the approval meaningful.
+  - id: estimate
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      partition_count: "1"
+      est_rows: "1284"
+      est_minutes: "4"
+      mode: "{{ inputs.full_refresh ? 'FULL REFRESH (drops and rebuilds)' : 'MERGE (upsert)' }}"
+
+  - id: plan
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      === BACKFILL PLAN: orders_elt ===
+      Range        : {{ inputs.start_date }} to {{ inputs.end_date }}
+      Partitions   : {{ outputs.estimate.values.partition_count }}
+      Est. rows    : {{ outputs.estimate.values.est_rows }}
+      Est. runtime : {{ outputs.estimate.values.est_minutes }} min
+      Mode         : {{ outputs.estimate.values.mode }}
+      Awaiting human approval - the warehouse has not been touched.
+
+  - id: approval_gate
+    type: io.kestra.plugin.core.flow.Pause
+    pauseDuration: PT1H
+    onResume:
+      - id: approved
+        displayName: Approve the backfill?
+        type: BOOL
+        defaults: true
+      - id: approver_note
+        displayName: Note for the audit record
+        type: STRING
+        defaults: Gap confirmed against source system.
+
+  - id: decision
+    type: io.kestra.plugin.core.flow.If
+    # Guarded: on gate expiry onResume is never populated, not even with the
+    # defaults above. No approval means no warehouse write.
+    condition: "{{ outputs.approval_gate.onResume is defined and outputs.approval_gate.onResume.approved }}"
+    then:
+      - id: run_partitions
+        type: io.kestra.plugin.core.flow.Loop
+        values: "{{ vars.partitions }}"
+        concurrencyLimit: 1
+        fetchType: FETCH
+        tasks:
+          - id: load_partition
+            type: io.kestra.plugin.core.log.Log
+            message: "dbt run --select orders_elt --vars '{run_date: {{ fromJson(item.value).date }}}' -> {{ fromJson(item.value).rows }} rows"
+      - id: verify
+        type: io.kestra.plugin.core.log.Log
+        message: "[verify] orders_elt 2026-09-19 present, 1284 rows, freshness now 0h -> gap closed"
+    else:
+      - id: aborted
+        type: io.kestra.plugin.core.log.Log
+        message: "Backfill NOT approved. Warehouse unchanged."
+
+  - id: record
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      outcome: "{{ (outputs.approval_gate.onResume is defined and outputs.approval_gate.onResume.approved) ? 'BACKFILLED' : 'NOT APPROVED' }}"
+      note: "{{ outputs.approval_gate.onResume is defined ? outputs.approval_gate.onResume.approver_note : 'approval gate expired with no decision' }}"
+
+outputs:
+  - id: outcome
+    type: STRING
+    displayName: Outcome
+    value: "{{ outputs.record.values.outcome }}"
+
+  - id: summary
+    type: STRING
+    displayName: Summary
+    value: "orders_elt {{ inputs.start_date }} to {{ inputs.end_date }}: {{ outputs.record.values.outcome }} ({{ outputs.estimate.values.partition_count }} partition, {{ outputs.estimate.values.est_rows }} rows). Note: {{ outputs.record.values.note }}"
+
+triggers:
+  - id: mcp
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    toolName: backfill_orders
+    title: Backfill the orders pipeline
+    toolDescription: >-
+      Backfills the orders data pipeline for a date range, filling gaps left by
+      failed runs. This writes to the warehouse and REQUIRES human approval - the
+      execution pauses until someone approves it in Kestra, so the result is not
+      immediate. Call this when asked to backfill, re-run or repair orders data
+      for specific dates.
+    annotations:
+      readOnly: false
+      destructive: true
+      idempotent: false
